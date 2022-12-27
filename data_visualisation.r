@@ -48,6 +48,7 @@ d <- subset %>%
   # TODO: maybe move these to the ggplots
   mutate(week_start = floor_date(timestamp, "week")) %>%
   mutate(week_start_delta = timestamp - week_start) %>%
+  mutate(day_start_delta = timestamp - day) %>%
   mutate(link = paste(src_host, "...", dst_host)) %>%
   mutate(week = week(timestamp)) %>%
   mutate(wday = wday(day, week_start = 1, label = TRUE, abbr = FALSE))
@@ -64,7 +65,7 @@ gg <- d %>%
     xlab("time") +
     labs(title = "Bitrate statistics averaged by day")
 
-show(gg)
+# show(gg)
 
 gg <- d %>%
   group_by(week_start_delta, link) %>%
@@ -75,5 +76,17 @@ gg <- d %>%
     ylab("bitrate") +
     xlab("time") +
     labs(title = "Bitrate statistics averaged by day of the week")
+
+# show(gg)
+
+gg <- d %>%
+  group_by(day_start_delta, link) %>%
+  summarize(avg = mean(incoming_rate_avg)) %>%
+  ggplot(aes(x = day_start_delta, y = avg, colour = link)) +
+    geom_line() +
+    scale_y_continuous(labels = format_si()) +
+    ylab("bitrate") +
+    xlab("time [s]") +
+    labs(title = "Bitrate statistics averaged by 24h")
 
 plot(gg)
