@@ -30,30 +30,34 @@ data_ts <- data %>%
 
 # TODO: investigate duplicate entries in the code below
 ts <- data_ts %>%
-    pivot_wider(id_cols = timestamp,
+    pivot_wider(
+        id_cols = timestamp,
         names_from = link,
         values_from = outgoing_rate_max_log,
         values_fn = ~head(.x, n = 1) # handle the duplicates
     ) %>%
     drop_na()
 
+ts.new <- select(ts, !timestamp)
+
 coeficients <- list()
 # all except the first column - timestamp
-for (col in colnames(ts)[-1]) {
+for (col in colnames(ts.new)[-1]) {
     print(col)
     frm <- as.formula(paste(col, "~ ."))
-    rf <- ranger(formula = frm, data = ts, importance = "impurity")
+    rf <- ranger(formula = frm, data = ts.new, importance = "impurity")
     res <- rf$variable.importance
     coeficients[[length(coeficients) + 1]] <- res
     # add this to a data frame
 }
 
-names(coeficients) <- colnames(ts)[-1]
+
+names(coeficients) <- colnames(ts.new)[-1]
 my_mat <- do.call(rbind, coeficients)
 my_df <- data.frame(id = names(coeficients), my_mat)
 
 f <- my_df %>%
-    select(!all_of(col, timestamp)) %>%
+    select(!c(col)) %>%
     pivot_longer(!id) %>%
     mutate(id = as.factor(id)) %>%
     mutate(name = as.factor(name)) %>%
@@ -62,4 +66,41 @@ f <- my_df %>%
 gg <- f %>%
     ggplot(aes(x = name, y = id)) +
         geom_tile(aes(fill = value, colour = "white"))
+show(gg)
+
+# goal: take previous observations in the account
+# so we need to include prev timestamps as parameters of our model
+# link1_ts1, link2_ts1, ..., link1_ts2, ...
+#
+# notes:
+# - number of embedings = time window = 3h = 36 samples
+
+emb <- embed(as.ts(ts), 36)
+colnames(emb) <- rep(colnames(ts), 36)
+# TODO: timestamp column is not used at all
+emb_data <- data.frame(emb) %>% select(!starts_with("timestamp."))
+
+# TODO: loop over links ... for (col in colnames(ts.new)[-1]) {
+rf <- emb_data %>%
+    # we dont need self correlation
+    select(!starts_with("b6_b1.")) %>%
+    select(!starts_with("b1_b6.")) %>%
+    ranger(formula = b6_b1 ~ . - timestamp,
+    data = ., importance = "impurity")
+
+coef <- rf$variable.importance
+print(sort(coef, decreasing = TRUE)[1:10])
+
+importance_df <- data.frame(coef, id = names(coef)) |>
+    mutate(id = as_factor(id))
+
+importance_df <- importance_df %>%
+    mutate(relative_ts =
+        as.numeric(sub(pattern = "^[^\\.]*\\.", id, replacement = ""))) %>%
+    mutate(link = sub(pattern = "(\\.[^.]+)$", id, replacement = ""))
+
+my_df$timest[1:15] <- rep(0, 15)
+
+gg <- importance_df %>%
+    ggplot(aes(x = relative_ts, y = link, fill = coef)) + geom_tile()
 show(gg)
