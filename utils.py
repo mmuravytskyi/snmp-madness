@@ -1,5 +1,7 @@
 import jraph
 import metadata
+import pandas as pd
+import plotnine as gg
 import networkx as nx
 
 def convert_jraph_to_networkx_graph(jraph_graph: jraph.GraphsTuple) -> nx.Graph:
@@ -28,3 +30,14 @@ def draw_jraph_graph_structure(jraph_graph: jraph.GraphsTuple) -> None:
       nx_graph, pos=pos, with_labels=True, node_size=500,
       labels=metadata.NODE_IDS_TO_LABELS_MAPPING
       )
+
+def plot_samples(truth, prediction):
+  assert truth.shape == prediction.shape
+  df = pd.DataFrame({'truth': truth.squeeze(), 'predicted': prediction.squeeze()}).reset_index()
+  df = pd.melt(df, id_vars=['index'], value_vars=['truth', 'predicted'])
+  plot = (
+      gg.ggplot(df)
+      + gg.aes(x='index', y='value', color='variable')
+      + gg.geom_line()
+  )
+  return plot
