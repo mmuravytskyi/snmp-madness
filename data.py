@@ -34,6 +34,8 @@ class SimpleDataLoader:
 
         _map = metadata.NODE_IDS_TO_LABELS_MAPPING
         self.edges_to_samples_mapping = {}
+        self.senders = jnp.array([], dtype=jnp.uint32)
+        self.receivers = jnp.array([], dtype=jnp.uint32)
 
         for x, row in enumerate(metadata.ADJACENCY_MATRIX):
             for y, _ in enumerate(row):
@@ -41,6 +43,9 @@ class SimpleDataLoader:
                 if metadata.ADJACENCY_MATRIX[x][y]:
                     self.edges_to_samples_mapping[(_map[x], _map[y])] = \
                         self.get_data_for_link(_map[x], _map[y])
+                    # for edges in jraph's GraphsTuple
+                    self.senders = jnp.append(self.senders, x)
+                    self.receivers = jnp.append(self.receivers, y)
 
         # collect metadata
         self.metadata = {
@@ -60,7 +65,7 @@ class SimpleDataLoader:
         self.unified_train_ds: jnp.array = jnp.array([sample for _, samples in
                                                       self.train_ds.items() for sample in samples])
 
-        del self.edges_to_samples_mapping
+        # del self.edges_to_samples_mapping
 
     @staticmethod
     @jax.jit
@@ -83,10 +88,29 @@ class SimpleDataLoader:
 
         return DataIter(f=self.get_batch, data=data)
 
+    def get_graph_data_iter(self, split: str, src: str = None, dst: str = None) -> DataIter:
+        assert split in ("train", "test")
+
+        if split == "train":
+            data = jnp.stack([samples for samples in self.edges_to_samples_mapping.values()])  # (15, X)
+        else:
+            assert src and dst
+            # TODO: fix this one
+            data = self.test_ds[(src, dst)]
+
+        return DataIter(f=self.get_graph_batch, data=data)  # (NUM_EDGES, BLOCK_SIZE)
+
     def get_batch(self, data: jnp.array) -> Batch:
         ixs = jax.random.randint(self.seed, (self.batch_size, ), 0, len(data) - self.block_size)
         x = jnp.stack([data[i:i+self.block_size] for i in ixs]).T
         y = jnp.stack([data[i+1:i+self.block_size+1] for i in ixs]).T
+        return {'input': x, 'target': y}  # Batch
+
+    def get_graph_batch(self, data: jnp.array) -> Batch:
+        _len = data.shape[1]
+        ixs = jax.random.randint(self.seed, (self.batch_size, ), 0, _len - self.block_size)
+        x = jnp.stack([data[:, i:i+self.block_size] for i in ixs])
+        y = jnp.stack([data[:, i+1:i+self.block_size+1] for i in ixs])
         return {'input': x, 'target': y}  # Batch
 
 
