@@ -1,5 +1,6 @@
 import pandas as pd
 import jax.numpy as jnp
+import haiku as hk
 import metadata
 import typing
 import jax
@@ -18,7 +19,16 @@ class DataIter:
 
 
 class SimpleDataLoader:
-    def __init__(self, data_path: str, block_size: int, batch_size: int, emb_size: int, split: float):
+    def __init__(self,
+                 data_path: str,
+                 block_size: int,
+                 batch_size: int,
+                 emb_size: int,
+                 split: float,
+                 normalize: bool = True,
+                 log: bool = True,
+                 shift: bool = False,
+                 batch_first: bool = False):
         if data_path.endswith(".pkl"):
             self.df = pd.read_pickle(data_path)
         elif data_path.endswith(".csv"):
@@ -30,178 +40,118 @@ class SimpleDataLoader:
         self.batch_size = batch_size
         self.emb_size = emb_size
         self.split = split
-        self.seed = jax.random.PRNGKey(2137)
+        self.normalize = normalize
+        self.log = log
+        self.shift = shift
+        self.batch_first = batch_first
+        self.seed = hk.PRNGSequence(2137)
 
-        _map = metadata.NODE_IDS_TO_LABELS_MAPPING
-        self.edges_to_samples_mapping = {}
-        self.senders = jnp.array([], dtype=jnp.uint32)
-        self.receivers = jnp.array([], dtype=jnp.uint32)
+        self.connections = metadata.CONNECTIONS
 
-        for x, row in enumerate(metadata.ADJACENCY_MATRIX):
-            for y, _ in enumerate(row):
+        self.edges_data = []
+        for conn in self.connections:
+            link_data = self.get_data_for_link(conn[0], conn[1])
+            self.edges_data.append(link_data)
 
-                if metadata.ADJACENCY_MATRIX[x][y]:
-                    self.edges_to_samples_mapping[(_map[x], _map[y])] = \
-                        self.get_data_for_link(_map[x], _map[y])
-                    # for edges in jraph's GraphsTuple
-                    self.senders = jnp.append(self.senders, x)
-                    self.receivers = jnp.append(self.receivers, y)
+        # For each src host take average incoming value except `cyfronet` and `ms`
+        # where outgoing value from the neighbouring node is used.
 
-        # collect metadata
-        self.metadata = {
-            k: {'mean': samples.mean(), 'std': samples.std()}
-            for k, samples in self.edges_to_samples_mapping.items()
-        }
+        self.connections.append(("ms", "b6"))
+        ms_b6 = self.df[(self.df["src_host"] == "b6") & (self.df["dst_host"] == "ms")].outgoing_rate_avg.to_numpy()
+        self.edges_data.append(ms_b6)
 
-        # train/test split
-        data_size = self.edges_to_samples_mapping[('uci', 'ftj')].shape[0]
-        split_idx = int(self.split * data_size)
-        self.train_ds: dict = {
-            k: samples[:split_idx] for k, samples in self.edges_to_samples_mapping.items()
-        }
-        self.test_ds: dict = {
-            k: samples[split_idx:] for k, samples in self.edges_to_samples_mapping.items()
-        }
-        self.unified_train_ds: jnp.array = jnp.array([sample for _, samples in
-                                                      self.train_ds.items() for sample in samples])
+        self.connections.append(("cyfronet", "uci"))
+        cyfronet_uci = self.df[(self.df["src_host"] == "uci") &
+                               (self.df["dst_host"] == "cyfronet")].outgoing_rate_avg.to_numpy()
+        self.edges_data.append(cyfronet_uci)
 
-        # del self.edges_to_samples_mapping
+        self.connections.append(("cyfronet", "ftj"))
+        ftj_cyfronet = self.df[(self.df["src_host"] == "ftj") &
+                               (self.df["dst_host"] == "cyfronet")].outgoing_rate_avg.to_numpy()
+        self.edges_data.append(ftj_cyfronet)
+
+        #  transform to a Jax NumPy array
+        self.edges_data = jnp.array(self.edges_data)  # (18, NUM_SAMPLES)
+
+        if self.log:
+            # we add 1 to avoid -Inf
+            self.edges_data = jnp.log(self.edges_data + 1)
+
+        self.edges_metadata = [
+            {'mean': s.mean(), 'std': s.std()} for s in self.edges_data
+        ]
+
+        if self.normalize:
+            self.edges_data = jnp.apply_along_axis(self.fn_normalize, 0, self.edges_data)
+
+        if self.shift:
+            self.edges_data = jnp.apply_along_axis(self.fn_shift, 0, self.edges_data)
+
+        split_idx = int(self.split * self.edges_data.shape[1])
+        self.edges_train_data = self.edges_data[:, :split_idx]
+        self.edges_test_data = self.edges_data[:, split_idx:]
+
+        del self.edges_data
 
     @staticmethod
-    @jax.jit
-    def normalize(arr: jnp.array):
-        # here we add 1 in order to avoid -INF for values below 1
-        return jnp.log(arr + 1)
+    def fn_normalize(arr: jnp.array):
+        return (arr - arr.mean())/arr.std()
 
-    def get_data_for_link(self, src: str, dst: str) -> jnp.array:
-        ss: pd.Series = self.df[(self.df["src_host"] == src) & (self.df["dst_host"] == dst)]
-        return ss.incoming_rate_avg.to_numpy()
+    @staticmethod
+    def fn_shift(arr: jnp.array):
+        return jnp.array(arr*25000 + 100000, dtype=jnp.uint32)
 
-    def get_data_iter(self, split: str, src: str = None, dst: str = None) -> DataIter:
+    def get_data_for_link(self, src: str = None, dst: str = None) -> jnp.array:
+        ss: pd.Series = self.df[(self.df["src_host"] == src) & (self.df["dst_host"] == dst)].incoming_rate_avg
+        return ss.to_numpy()
+
+    def get_graph_data_iter(self, split: str) -> DataIter:
         assert split in ("train", "test")
 
         if split == "train":
-            data = self.unified_train_ds
+            data = self.edges_train_data
         else:
-            assert src and dst
-            data = self.test_ds[(src, dst)]
+            data = self.edges_test_data
+
+        return DataIter(f=self.get_graph_batch, data=data)
+
+    def get_data_iter(self, split: str) -> DataIter:
+        assert split in ("train", "test")
+
+        # here we have flattened data for simple RNNs
+        if split == "train":
+            data = jnp.ravel(self.edges_train_data)
+        else:
+            data = jnp.ravel(self.edges_test_data)
 
         return DataIter(f=self.get_batch, data=data)
 
-    def get_graph_data_iter(self, split: str, src: str = None, dst: str = None) -> DataIter:
-        assert split in ("train", "test")
-
-        if split == "train":
-            data = jnp.stack([samples for samples in self.edges_to_samples_mapping.values()])  # (15, X)
-        else:
-            assert src and dst
-            # TODO: fix this one
-            data = self.test_ds[(src, dst)]
-
-        return DataIter(f=self.get_graph_batch, data=data)  # (NUM_EDGES, BLOCK_SIZE)
-
     def get_batch(self, data: jnp.array) -> Batch:
-        ixs = jax.random.randint(self.seed, (self.batch_size, ), 0, len(data) - self.block_size)
-        x = jnp.stack([data[i:i+self.block_size] for i in ixs]).T
-        y = jnp.stack([data[i+1:i+self.block_size+1] for i in ixs]).T
-        return {'input': x, 'target': y}  # Batch
+        ixs = jax.random.randint(next(self.seed), (self.batch_size, ), 0, len(data) - self.block_size)
+        x = jnp.stack([data[i:i+self.block_size] for i in ixs])
+        y = jnp.stack([data[i+1:i+self.block_size+1] for i in ixs])
+        if self.batch_first:
+            return {'input': x, 'target': y}  # Batch
+        else:
+            return {'input': x.T, 'target': y.T}  # Batch
 
     def get_graph_batch(self, data: jnp.array) -> Batch:
-        _len = data.shape[1]
-        ixs = jax.random.randint(self.seed, (self.batch_size, ), 0, _len - self.block_size)
+        _len = data.shape[-1]
+        ixs = jax.random.randint(next(self.seed), (self.batch_size, ), 0, _len - self.block_size)
         x = jnp.stack([data[:, i:i+self.block_size] for i in ixs])
         y = jnp.stack([data[:, i+1:i+self.block_size+1] for i in ixs])
         return {'input': x, 'target': y}  # Batch
 
 
-class DataLoader:
-    def __init__(self, data_path: str, block_size: int, batch_size: int, emb_size: int, split: float):
-        self.df = pd.read_pickle(data_path)
-        self.block_size = block_size
-        self.batch_size = batch_size
-        self.emb_size = emb_size
-        self.split = split
+if __name__ == "__main__":
+    sdl = SimpleDataLoader("../data/samples_5m_subset_v1.pkl", 288, 8, 1, 0.85, batch_first=True)
 
-        _map = metadata.NODE_IDS_TO_LABELS_MAPPING
-        self.edges_to_samples_mapping = {}
+    train_di = sdl.get_graph_data_iter("train")
+    d = next(train_di)
+    print("Graph shape:")
+    print(d['input'].shape)
 
-        for x, row in enumerate(metadata.ADJACENCY_MATRIX):
-            for y, _ in enumerate(row):
-
-                if metadata.ADJACENCY_MATRIX[x][y]:
-                    self.edges_to_samples_mapping[(_map[x], _map[y])] = \
-                        self.get_data_for_link(_map[x], _map[y])
-
-        _b = self.block_size * self.batch_size
-        # all the sample array are equal size, so it doesn't matter which one we choose
-        num_subsets = (self.edges_to_samples_mapping[('uci', 'ftj')].shape[0] - 1) // _b
-        cutoff_num = (self.edges_to_samples_mapping[('uci', 'ftj')].shape[0] - 1) % _b
-        split_idx = int(self.split * num_subsets)
-
-        # collect metadata
-        self.metadata = {
-            k: {'mean': samples.mean(), 'std': samples.std()}
-            for k, samples in self.edges_to_samples_mapping.items()
-        }
-
-        #  encode & normalize the data
-        self.edges_to_samples_mapping = {
-            k: self.normalize(self.encode(samples))
-            for k, samples in self.edges_to_samples_mapping.items()
-        }
-
-        #  input/target split
-        self.edges_to_samples_mapping = {
-            k: {'input': samples[:-1], 'target': samples[1:]}
-            for k, samples in self.edges_to_samples_mapping.items()
-        }
-
-        #  rounding to batchable size & pre-batching
-        self.edges_to_samples_mapping = {
-            k: {
-                'input': jnp.reshape(samples['input'][:-cutoff_num],
-                                     (num_subsets, self.block_size, self.batch_size, self.emb_size)),
-                'target': jnp.reshape(samples['target'][:-cutoff_num],
-                                      (num_subsets, self.block_size, self.batch_size, self.emb_size))
-            } for k, samples in self.edges_to_samples_mapping.items()
-        }
-
-        #  batching
-        self.edges_to_samples_mapping = {
-            k: [
-                {
-                    'input': samples['input'][idx], 'target': samples['target'][idx]
-                } for idx in range(samples['input'].shape[0])
-            ] for k, samples in self.edges_to_samples_mapping.items()
-        }
-
-        self.train_ds = {
-            k: samples[:split_idx] for k, samples in self.edges_to_samples_mapping.items()
-        }
-        self.test_ds = {
-            k: samples[split_idx:] for k, samples in self.edges_to_samples_mapping.items()
-        }
-        self.unified_train_ds = [sample for _, samples in self.train_ds.items() for sample in samples]
-
-    def get_edge_data_iterator(self, src: str, dst: str, train=True, all=True):
-        if train:
-            if all:
-                data = self.unified_train_ds
-            else:
-                data = self.train_ds[(src, dst)]
-        else:
-            data = self.test_ds[(src, dst)]
-        return DataIter(data)
-
-    @staticmethod
-    def encode(arr: jnp.array):
-        # here we add 1 in order to avoid -INF for values below 1
-        return jnp.log(arr + 1)
-
-    @staticmethod
-    def normalize(arr: jnp.array):
-        return (arr - arr.mean())/arr.std()
-
-    def get_data_for_link(self, src: str, dst: str) -> jnp.array:
-        ss: pd.Series = self.df[(self.df["src_host"] == src) & (self.df["dst_host"] == dst)]
-        return ss.incoming_rate_avg.to_numpy()
+    train_di = sdl.get_data_iter("train")
+    d = next(train_di)
+    print("Regular shape:")
+    print(d['input'].shape)
